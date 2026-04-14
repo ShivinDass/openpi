@@ -65,17 +65,34 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, batched=True) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        if not batched:
+            inputs = self._input_transform(inputs)
+        else:
+            batch_size = inputs["observation/state"].shape[0]
+            transformed_inputs = []
+            for i in range(batch_size):
+                inputs_i = jax.tree.map(lambda x: x[i], inputs)
+                inputs_i = self._input_transform(inputs_i)
+                transformed_inputs.append(inputs_i)
+            # inputs = {k: jax.numpy.stack([o[k] for o in transformed_inputs], axis=0) for k in transformed_inputs[0].keys()}
+            inputs = jax.tree.map(lambda *xs: jax.numpy.stack(xs, axis=0), *transformed_inputs)
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
-            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            if not batched:
+                inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            else:
+                inputs = jax.tree.map(lambda x: jnp.asarray(x), inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            if not batched:
+                inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            else:
+                inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device), inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
@@ -95,11 +112,28 @@ class Policy(BasePolicy):
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            if not batched:
+                outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            else:
+                outputs = jax.tree.map(lambda x: np.asarray(x.detach().cpu()), outputs)
         else:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            if not batched:
+                outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            else:
+                outputs = jax.tree.map(lambda x: np.asarray(x), outputs)
 
-        outputs = self._output_transform(outputs)
+        # print('raw action shape:', outputs["actions"].shape)
+        
+        if not batched:
+            outputs = self._output_transform(outputs)
+        else:
+            transformed_outputs = []
+            for i in range(outputs["actions"].shape[0]):
+                outputs_i = jax.tree.map(lambda x: x[i], outputs)
+                outputs_i = self._output_transform(outputs_i)
+                transformed_outputs.append(outputs_i)
+            outputs = jax.tree.map(lambda *xs: np.stack(xs, axis=0), *transformed_outputs)
+        # print('transformed action shape:', outputs["actions"].shape)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

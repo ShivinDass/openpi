@@ -12,6 +12,7 @@ import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
+import os
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -354,6 +355,66 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class RLDSLiberoDataConfig(DataConfigFactory):
+    """
+    Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
+    """
+
+    rlds_data_dir: str | None = None
+    extra_delta_transform: bool = False
+
+    # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
+    # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
+    # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
+
+    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation/image",
+                        "observation/wrist_image": "observation/wrist_image",
+                        "observation/state": "observation/state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        assert self.rlds_data_dir is not None, "Need to set rlds data dir for RLDS data loader."
+
+        print(epath.Path(self.assets.assets_dir or assets_dirs), 'libero90')
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), 'libero90')
+        print(norm_stats)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            rlds_data_dir=self.rlds_data_dir,
+            norm_stats=norm_stats,
+            datasets=self.datasets,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -825,6 +886,121 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=64,
     ),
+    
+    # Custom split loader config
+    TrainConfig(
+        name="gdg_libero_single_pi0_lora",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=RLDSLiberoDataConfig(
+            repo_id="gdg_single_task",
+            # rlds_data_dir=os.path.join(os.environ['DATA_DIR'], 'tf'),
+            rlds_data_dir="/mnt/hdd3/shivin/gdg/libero/tensorflow_datasets",
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="libero90", # val_5
+                    # name="val_5",
+                    version="0.1.0",
+                    weight=1.0
+                ),
+            ),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+        
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
+    # Custom split loader config
+    TrainConfig(
+        name="gdg_libero_cotrain_pi0_lora",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=RLDSLiberoDataConfig(
+            repo_id="gdg_cotrain_task",
+            rlds_data_dir=os.path.join(os.environ['DATA_DIR'], 'tf'),
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    # name="val_5",
+                    name=os.environ.get('DATASET_NAME', None),
+                    version="0.1.0",
+                    weight=0.5
+                ),
+                droid_rlds_dataset.RLDSDataset(
+                    # name="task5traj5_traj20_explore_exploit_vlm_evol_soup_butter_tray_1",
+                    name='val_5_human_curated_exact_data',
+                    version="0.1.0",
+                    weight=0.5
+                ),
+            ),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=32,
+        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+        
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
+
+    # Custom split loader config
+    TrainConfig(
+        name="gdg_libero_cotrain_pi05_lora",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", pi05=True),
+        data=RLDSLiberoDataConfig(
+            repo_id="gdg_cotrain_task",
+            rlds_data_dir=os.path.join(os.environ['DATA_DIR'], 'tf'),
+            datasets=(
+                droid_rlds_dataset.RLDSDataset(
+                    name="val_5",
+                    version="0.1.0",
+                    weight=0.5
+                ),
+                droid_rlds_dataset.RLDSDataset(
+                    name="task5traj5_traj20_explore_exploit_vlm_evol_soup_butter_tray_1",
+                    version="0.1.0",
+                    weight=0.5
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=2_500,
+        batch_size=32,
+        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+        
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", pi05=True
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
     #
     # Fine-tuning DROID configs.
     #
